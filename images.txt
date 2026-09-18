@@ -15,3 +15,6 @@ rhasspy/wyoming-openwakeword:latest
 
 # 6. 本地轻量大语言模型服务 (Ollama)
 ollama/ollama:latest
+
+# 7. Home Assistant for China
+ghcr.io/hasscc/hacn:latest
