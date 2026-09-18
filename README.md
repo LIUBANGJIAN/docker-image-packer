@@ -17,7 +17,7 @@ docker load -i xxxx.tar
 - **旧版自动清理**：新 Release 发布成功后，自动删除历史 `pack-*` 与遗留 `latest` 版。
 - **gh-proxy 加速链接**：Release Notes 和运行摘要中同时给出原始下载链接与 `gh-proxy.com` 加速链接，便于国内网络下载。
 - **Docker Hub 限流规避**：支持可选登录态拉取（高限额），无凭据时自动退回匿名并对拉取做指数退避重试。
-- **镜像版本固定**：`images.txt` 默认固定到具体版本号，保证两次打包结果一致、可复现。
+- **追踪上游最新**：`images.txt` 使用 `latest` / `stable` 追踪 tag，每次打包拉取上游当前最新版本。
 
 ## 使用方法
 
@@ -26,16 +26,22 @@ docker load -i xxxx.tar
 每行一个镜像，`#` 开头为注释，支持两种写法：
 
 ```
-# 直接拉取（Docker Hub 或 GHCR），建议固定版本号保证可复现
-ollama/ollama:0.34.0
-ghcr.io/home-assistant/home-assistant:2026.9.2
+# 直接拉取（Docker Hub 或 GHCR），用最新/稳定追踪 tag
+ollama/ollama:latest
+ghcr.io/home-assistant/home-assistant:stable
 
 # 源码构建
 build:https://github.com/xiasi0/wyoming-sherpa-onnx.git|wyoming-sherpa-onnx:local
 ```
 
-> **重要**：请把镜像 tag 固定为具体版本号，而非 `latest`。`latest` 是浮动 tag，
-> 两次打包导出的内容可能不同，会导致离线分发不可复现。
+追踪 tag 约定：
+
+- `latest`：Docker Hub 的浮动 tag，指向最近一次推送，适合 `rhasspy/*`、`ollama/ollama` 等。
+- `stable`：Home Assistant 官方镜像（`ghcr.io/home-assistant/home-assistant`）与
+  `ghcr.io/hasscc/hacn` 的"最新稳定版"追踪 tag，比 `latest` 语义更明确。
+
+> **注意**：追踪 tag 每次打包都会拉取上游最新内容，同一镜像两次打包的结果可能不同。
+> 这符合"始终用最新版"的诉求——只要每一次都重新触发打包即可拿到最新。
 
 ### 2. （可选）配置 Docker Hub 登录，规避限流
 
@@ -56,7 +62,7 @@ GitHub 的共享 runner 出口 IP 使用 Docker Hub 匿名拉取时，容易命�
 在仓库 **Actions** 页选择「Pack Docker Images」→ **Run workflow**：
 
 - 输入 `all`（默认）：打包 `images.txt` 里的全部镜像。
-- 输入具体镜像名（如 `ollama/ollama:0.34.0`）：只打包该单个镜像。
+- 输入具体镜像名（如 `ollama/ollama:latest`）：只打包该单个镜像。
 
 ### 4. 下载
 
@@ -67,10 +73,10 @@ GitHub 的共享 runner 出口 IP 使用 Docker Hub 匿名拉取时，容易命�
 
 ```bash
 # Linux / macOS / Git Bash
-cat ollama_ollama_0.34.0.zip.part* > ollama_ollama_0.34.0.zip
+cat ollama_ollama_latest.zip.part* > ollama_ollama_latest.zip
 
 # Windows CMD
-copy /b ollama_ollama_0.34.0.zip.part000 + ollama_ollama_0.34.0.zip.part001 ollama_ollama_0.34.0.zip
+copy /b ollama_ollama_latest.zip.part000 + ollama_ollama_latest.zip.part001 ollama_ollama_latest.zip
 ```
 
 最后离线导入：

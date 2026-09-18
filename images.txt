@@ -1,20 +1,20 @@
-# 1. Home Assistant（官方镜像，固定到具体补丁版本，保证可复现）
-ghcr.io/home-assistant/home-assistant:2026.9.2
+# 1. Home Assistant（官方镜像，stable = 最新稳定版追踪 tag）
+ghcr.io/home-assistant/home-assistant:stable
 
 # 2. Wyoming Whisper（faster-whisper）
-rhasspy/wyoming-whisper:3.8.1
+rhasspy/wyoming-whisper:latest
 
 # 3. Wyoming Sherpa-ONNX 源码构建
 build:https://github.com/xiasi0/wyoming-sherpa-onnx.git|wyoming-sherpa-onnx:local
 
 # 4. 离线文本转语音 (TTS) - Piper
-rhasspy/wyoming-piper:2.5.2
+rhasspy/wyoming-piper:latest
 
 # 5. openWakeWord 唤醒词检测
-rhasspy/wyoming-openwakeword:2.1.0
+rhasspy/wyoming-openwakeword:latest
 
 # 6. 本地轻量大语言模型服务 (Ollama)
-ollama/ollama:0.34.0
+ollama/ollama:latest
 
-# 7. Home Assistant for China（官方稳定追踪 tag）
+# 7. Home Assistant for China（官方最新稳定版追踪 tag）
 ghcr.io/hasscc/hacn:stable
