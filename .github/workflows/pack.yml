@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       image:
-        description: '要打包的镜像："all" = 打包 images.txt 全部；或填具体镜像名（如 ollama/ollama:latest）只打包单个'
+        description: '要打包的镜像："all" = 打包 images.txt 全部；或填具体镜像名（如 ollama/ollama:0.34.0）只打包单个'
         required: false
         type: string
         default: 'all'
@@ -159,45 +159,87 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 没有任何成功镜像包时，跳过发布（也不误删旧版）
+          set -euo pipefail
+          shopt -s nullglob
+
+          # 没有任何成功镜像包时，跳过发布（也不动已有 Release）
           if ! compgen -G "dist/*.zip" > /dev/null; then
             echo "::notice::本次没有成功打包的镜像，跳过发布"
             exit 0
           fi
 
-          TAG="latest"
           REPO="${{ github.repository }}"
           GHPROXY="https://gh-proxy.com"
+          TAG="pack-${{ github.run_number }}"
 
-          echo "== 删除旧版 Release（覆盖式发布）=="
-          gh release delete "$TAG" --yes --cleanup-tag >/dev/null 2>&1 || true
+          # GitHub 单个 Release asset 硬上限为 2 GiB，超限必须分片
+          LIMIT=$(( 2*1024*1024*1024 ))
+          THRESHOLD=$(( LIMIT - 64*1024*1024 ))   # 判定分片阈值，留余量
+          CHUNK=$(( 1*1024*1024*1024 ))           # 单片 1 GiB
+
+          rm -rf upload && mkdir -p upload
+          splitted=()
+          for f in dist/*.zip; do
+            size=$(stat -c %s "$f")
+            base="$(basename "$f" .zip)"
+            if [ "$size" -le "$THRESHOLD" ]; then
+              cp "$f" upload/
+            else
+              echo "::warning::${base}.zip 体积 $(numfmt --to=iec "$size")，超单 asset 上限，拆分为 1 GiB 分卷"
+              split -b "$CHUNK" -d -a 3 "$f" "upload/${base}.zip.part"
+              splitted+=("$base")
+            fi
+          done
 
           NOTES_FILE="$(mktemp)"
           {
             echo "## 打包结果"
             echo ""
-            echo "本次共打包 $(find dist -maxdepth 1 -name '*.zip' | wc -l) 个镜像包："
-            echo ""
-            for f in dist/*.zip; do
-              echo "- \`$(basename "$f")\`"
-            done
+            echo "本次共打包 $(find dist -maxdepth 1 -name '*.zip' | wc -l) 个镜像包。"
             echo ""
             echo "## 下载链接"
             echo ""
-            echo "| 镜像包 | 原始链接 | gh-proxy 加速 |"
+            echo "| 文件 | 原始链接 | gh-proxy 加速 |"
             echo "| :--- | :--- | :--- |"
-            for f in dist/*.zip; do
-              name="$(basename "$f")"
+            for a in upload/*; do
+              name="$(basename "$a")"
               url="https://github.com/${REPO}/releases/download/${TAG}/${name}"
               echo "| \`${name}\` | [下载](${url}) | [加速](${GHPROXY}/${url}) |"
             done
-            echo ""
+            if [ "${#splitted[@]}" -gt 0 ]; then
+              echo ""
+              echo "## 分片合并（超 2 GiB 的镜像）"
+              echo ""
+              echo "以下镜像已拆分为 .part* 分卷，需下载全部同名分卷后合并还原："
+              echo ""
+              for base in "${splitted[@]}"; do
+                echo '```bash'
+                echo "# Linux / macOS / Git Bash：先合并分卷为完整 zip"
+                echo "cat ${base}.zip.part* > ${base}.zip"
+                echo "# Windows CMD 用：copy /b ${base}.zip.part000 + ${base}.zip.part001 ${base}.zip"
+                echo '```'
+                echo ""
+              done
+            fi
             echo "> 离线导入：先解压 zip 得到 .tar，再执行 \`docker load -i xxxx.tar\`"
           } > "$NOTES_FILE"
 
-          gh release create "$TAG" dist/*.zip \
+          # 先创建本次 Release；失败时已有 Release 不受影响（保证原子性）
+          gh release create "$TAG" upload/* \
             --title "Docker Image Pack #${{ github.run_number }}" \
             --notes-file "$NOTES_FILE"
+
+          # 发布成功后再清理旧版（清理历史 pack-* 与遗留的 latest，排除本次）
+          OLD_TAGS=$(gh release list --json tagName -q '[.[].tagName] | join(" ")' 2>/dev/null || true)
+          for old in $OLD_TAGS; do
+            [ "$old" = "$TAG" ] && continue
+            case "$old" in
+              pack-*|latest)
+                echo "删除旧 release: $old"
+                gh release delete "$old" --yes --cleanup-tag || echo "::warning::删除 $old 失败"
+                ;;
+            esac
+          done
 
           echo "== 发布完成，下载链接如下 =="
           cat "$NOTES_FILE" >> "$GITHUB_STEP_SUMMARY"
