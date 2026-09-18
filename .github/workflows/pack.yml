@@ -2,12 +2,15 @@ name: Pack Docker Images
 
 on:
   workflow_dispatch:
-
-env:
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
+    inputs:
+      image:
+        description: '要打包的镜像："all" = 打包 images.txt 全部；或填具体镜像名（如 ollama/ollama:latest）只打包单个'
+        required: false
+        type: string
+        default: 'all'
 
 jobs:
-  # 1. 解析 images.txt 并动态生成矩阵
+  # 1. 解析目标，生成矩阵（支持全部或单个镜像）
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -19,11 +22,21 @@ jobs:
       - name: Generate Matrix
         id: set-matrix
         run: |
-          # 读取 images.txt，过滤掉注释和空行，转换为 JSON 数组
-          JSON_ARRAY=$(grep -v '^#' images.txt | grep -v '^\s*$' | jq -R . | jq -s -c .)
-          echo "matrix=$JSON_ARRAY" >> $GITHUB_OUTPUT
+          TARGET='${{ inputs.image }}'
+          if [ -z "$TARGET" ] || [ "$TARGET" = "all" ]; then
+            JSON_ARRAY=$(awk 'NF && $1 !~ /^#/' images.txt | jq -R . | jq -s -c .)
+          else
+            JSON_ARRAY=$(printf '%s' "$TARGET" | jq -R . | jq -s -c .)
+          fi
 
-  # 2. 矩阵并行构建与导出：每个镜像独立开一个 Job，独立打包为单个 ZIP
+          if [ "$JSON_ARRAY" = "[]" ]; then
+            echo "::error::images.txt 中没有有效镜像，或指定的目标镜像为空"
+            exit 1
+          fi
+
+          echo "matrix=$JSON_ARRAY" >> "$GITHUB_OUTPUT"
+
+  # 2. 矩阵并行构建与导出：每个镜像独立一个 Job，独立打包为单个 ZIP
   build-and-pack:
     needs: prepare
     runs-on: ubuntu-latest
@@ -36,17 +49,49 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v5
 
-      # 清除凭证进入纯匿名模式，规避登录 Token 冲突
-      - name: Force Anonymous Mode
+      # 清除 runner 预置凭证（规避 GHCR token 冲突）
+      # 若配置了 Docker Hub 凭据则登录，享受更高拉取限额（匿名模式易被限流）
+      - name: Configure Docker Auth
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          docker logout ghcr.io || true
-          docker logout docker.io || true
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          docker logout docker.io >/dev/null 2>&1 || true
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin >/dev/null 2>&1 \
+              && echo "::notice::已使用登录态拉取 Docker Hub（高限额）" \
+              || echo "::warning::Docker Hub 登录失败，退回匿名拉取"
+          else
+            echo "::warning::未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN，使用匿名拉取（受 Docker Hub 限流影响）"
+          fi
 
       - name: Process Image
         id: process
         run: |
           LINE="${{ matrix.target }}"
           echo "=================================================="
+
+          # 拉取函数：指数退避重试，规避 Docker Hub 限流与瞬时网络抖动
+          pull_with_retry() {
+            local image="$1"
+            local max_retries=4
+            local retry=0
+            local delay=5
+            while true; do
+              if docker pull "$image"; then
+                return 0
+              fi
+              retry=$((retry + 1))
+              if [ "$retry" -ge "$max_retries" ]; then
+                echo "::error::拉取失败，已重试 ${max_retries} 次: $image"
+                return 1
+              fi
+              echo "::warning::第 ${retry} 次拉取失败，${delay} 秒后重试: $image"
+              sleep "$delay"
+              delay=$((delay * 2))
+            done
+          }
 
           # 模式 A：源码现场构建 (build:https://github.com/xxx.git|tag_name)
           if [[ "$LINE" == build:* ]]; then
@@ -66,7 +111,7 @@ jobs:
           else
             TARGET_IMAGE="$LINE"
             echo "【直接拉取模式】 镜像名: $TARGET_IMAGE"
-            docker pull "$TARGET_IMAGE"
+            pull_with_retry "$TARGET_IMAGE"
           fi
 
           # 格式化导出文件与 Artifacts 名称
@@ -76,17 +121,83 @@ jobs:
 
           echo "正在导出镜像 $TARGET_IMAGE 到 $TAR_FILE ..."
           docker save "$TARGET_IMAGE" -o "$TAR_FILE"
-          
+
           echo "正在压缩为 $ZIP_FILE ..."
           zip -j "$ZIP_FILE" "$TAR_FILE"
-          
-          echo "zip_path=$ZIP_FILE" >> $GITHUB_OUTPUT
-          echo "artifact_name=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      # 3. 独立上传单独的 ZIP Artifact（保存 7 天）
-      - name: Upload Single Artifact
+          echo "zip_path=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$SAFE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.process.outputs.artifact_name }}
           path: ${{ steps.process.outputs.zip_path }}
           retention-days: 7
+
+  # 3. 覆盖式发布到 GitHub Releases，并生成原始链接 + gh-proxy 加速链接
+  release:
+    needs: build-and-pack
+    # 只要不是被取消/被跳过（prepare 失败），就尝试发布当前已成功的包：
+    # fail-fast:false 下部分镜像失败时，仍发布成功的那部分
+    if: ${{ !cancelled() && needs.build-and-pack.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 没有任何成功镜像包时，跳过发布（也不误删旧版）
+          if ! compgen -G "dist/*.zip" > /dev/null; then
+            echo "::notice::本次没有成功打包的镜像，跳过发布"
+            exit 0
+          fi
+
+          TAG="latest"
+          REPO="${{ github.repository }}"
+          GHPROXY="https://gh-proxy.com"
+
+          echo "== 删除旧版 Release（覆盖式发布）=="
+          gh release delete "$TAG" --yes --cleanup-tag >/dev/null 2>&1 || true
+
+          NOTES_FILE="$(mktemp)"
+          {
+            echo "## 打包结果"
+            echo ""
+            echo "本次共打包 $(find dist -maxdepth 1 -name '*.zip' | wc -l) 个镜像包："
+            echo ""
+            for f in dist/*.zip; do
+              echo "- \`$(basename "$f")\`"
+            done
+            echo ""
+            echo "## 下载链接"
+            echo ""
+            echo "| 镜像包 | 原始链接 | gh-proxy 加速 |"
+            echo "| :--- | :--- | :--- |"
+            for f in dist/*.zip; do
+              name="$(basename "$f")"
+              url="https://github.com/${REPO}/releases/download/${TAG}/${name}"
+              echo "| \`${name}\` | [下载](${url}) | [加速](${GHPROXY}/${url}) |"
+            done
+            echo ""
+            echo "> 离线导入：先解压 zip 得到 .tar，再执行 \`docker load -i xxxx.tar\`"
+          } > "$NOTES_FILE"
+
+          gh release create "$TAG" dist/*.zip \
+            --title "Docker Image Pack #${{ github.run_number }}" \
+            --notes-file "$NOTES_FILE"
+
+          echo "== 发布完成，下载链接如下 =="
+          cat "$NOTES_FILE" >> "$GITHUB_STEP_SUMMARY"
