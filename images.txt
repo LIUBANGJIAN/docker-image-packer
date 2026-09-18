@@ -1,5 +1,6 @@
 # 1. Home Assistant（官方镜像，stable = 最新稳定版追踪 tag）
 ghcr.io/home-assistant/home-assistant:stable
+ghcr.io/home-assistant/home-assistant:latest
 
 # 2. Wyoming Whisper（faster-whisper）
 rhasspy/wyoming-whisper:latest
